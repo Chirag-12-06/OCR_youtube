@@ -1,11 +1,16 @@
 import os
-import pytesseract
-import cv2
+from pathlib import Path
 
-input_folder = "bills_cleaned"
-output_file = "bills_cleaned.txt"
+import cv2
+import pytesseract
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INPUT_FOLDER = PROJECT_ROOT / "inputs" / "bills_cleaned"
+OUTPUT_FILE = PROJECT_ROOT / "inputs" / "bills_cleaned.txt"
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 
 def ocr_processor(input_folder, output_file):
     extracted_text = ""
@@ -37,10 +42,9 @@ def ocr_processor(input_folder, output_file):
                 print(f"Problem processing {filename}: {e}")
 
     # WRITE ONCE (like a civilized program)
-    with open(output_file, 'w', encoding='utf-8') as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write(extracted_text)
 
-        
-if __name__ == "__main__":
-    ocr_processor(input_folder, output_file)
 
+if __name__ == "__main__":
+    ocr_processor(INPUT_FOLDER, OUTPUT_FILE)

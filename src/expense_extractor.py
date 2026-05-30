@@ -2,17 +2,21 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 
 import requests
 
 
-INPUT_FILE = "bills_cleaned.txt"
-OUTPUT_CSV = "expenses_table.csv"
-OUTPUT_JSON = "expenses_table.json"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INPUT_FILE = PROJECT_ROOT / "inputs" / "bills_cleaned.txt"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+OUTPUT_CSV = OUTPUT_DIR / "expenses_table.csv"
+OUTPUT_JSON = OUTPUT_DIR / "expenses_table.json"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_MAX_RETRIES = 3
 
 
@@ -34,7 +38,6 @@ EXPENSE_SCHEMA = {
                     "items",
                     "taxes_and_charges",
                     "subtotal",
-                    "final_bill_amount",
                     "confidence",
                     "warnings",
                 ],
@@ -53,8 +56,9 @@ EXPENSE_SCHEMA = {
                                 "quantity",
                                 "unit_price",
                                 "base_amount",
+                                "tax_percentage",
                                 "taxes_and_charges_allocated",
-                                "final_item_cost",
+                                "final_item_amount",
                                 "notes",
                             ],
                             "properties": {
@@ -62,8 +66,9 @@ EXPENSE_SCHEMA = {
                                 "quantity": {"type": ["number", "null"]},
                                 "unit_price": {"type": ["number", "null"]},
                                 "base_amount": {"type": ["number", "null"]},
+                                "tax_percentage": {"type": ["number", "null"]},
                                 "taxes_and_charges_allocated": {"type": ["number", "null"]},
-                                "final_item_cost": {"type": ["number", "null"]},
+                                "final_item_amount": {"type": ["number", "null"]},
                                 "notes": {"type": ["string", "null"]},
                             },
                         },
@@ -81,7 +86,6 @@ EXPENSE_SCHEMA = {
                         },
                     },
                     "subtotal": {"type": ["number", "null"]},
-                    "final_bill_amount": {"type": ["number", "null"]},
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "warnings": {"type": "array", "items": {"type": "string"}},
                 },
@@ -98,6 +102,206 @@ def money(value):
         return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     except (InvalidOperation, ValueError):
         return str(value)
+
+
+def bill_value_signature(value):
+    if value in (None, ""):
+        return None
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def item_signature(item):
+    return (
+        item.get("name") or "",
+        bill_value_signature(item.get("quantity")),
+        bill_value_signature(item.get("unit_price")),
+        bill_value_signature(item.get("base_amount")),
+        bill_value_signature(item.get("tax_percentage")),
+        bill_value_signature(item.get("taxes_and_charges_allocated")),
+        bill_value_signature(item.get("final_item_amount")),
+        item.get("notes") or "",
+    )
+
+
+def bill_signature(bill):
+    return (
+        bill.get("date") or "",
+        bill.get("currency") or "",
+        bill_value_signature(bill.get("subtotal")),
+        tuple(
+            (tax.get("name") or "", bill_value_signature(tax.get("amount")))
+            for tax in bill.get("taxes_and_charges", [])
+        ),
+        tuple(item_signature(item) for item in bill.get("items", [])),
+    )
+
+
+def restaurant_name_score(name):
+    if not name:
+        return 0
+
+    score = 0
+    normalized = name.strip().lower()
+    legal_entity_terms = {
+        "enterprise",
+        "enterprises",
+        "pvt",
+        "private",
+        "ltd",
+        "limited",
+        "llp",
+        "company",
+        "co",
+        "corp",
+        "corporation",
+        "trading",
+        "traders",
+        "stores",
+        "store",
+    }
+
+    if not any(term in normalized for term in legal_entity_terms):
+        score += 3
+
+    if name == name.title():
+        score += 2
+    elif name != name.upper():
+        score += 1
+
+    if len(name.split()) <= 4:
+        score += 1
+
+    if name.isupper():
+        score -= 1
+
+    return score
+
+
+def choose_preferred_bill(existing_bill, new_bill):
+    existing_score = restaurant_name_score(existing_bill.get("restaurant_name") or "")
+    new_score = restaurant_name_score(new_bill.get("restaurant_name") or "")
+
+    if new_score > existing_score:
+        return new_bill
+    return existing_bill
+
+
+def dedupe_bills(bills):
+    deduped = {}
+    for bill in bills:
+        signature = bill_signature(bill)
+        if signature not in deduped:
+            deduped[signature] = bill
+            continue
+
+        kept_bill = choose_preferred_bill(deduped[signature], bill)
+        duplicate_bill = bill if kept_bill is deduped[signature] else deduped[signature]
+
+        warnings = kept_bill.setdefault("warnings", [])
+        duplicate_name = duplicate_bill.get("restaurant_name") or "Unknown merchant"
+        if duplicate_name not in warnings:
+            warnings.append(
+                f"Duplicate entry detected under different restaurant names: {duplicate_name}."
+            )
+
+        deduped[signature] = kept_bill
+
+    return list(deduped.values())
+
+
+def bill_tax_percentage(bill):
+    tax_percentages = []
+
+    for tax in bill.get("taxes_and_charges", []):
+        name = tax.get("name") or ""
+        percentages = re.findall(r"(-?\d+(?:\.\d+)?)\s*%", name)
+        for percentage in percentages:
+            try:
+                tax_percentages.append(Decimal(percentage))
+            except InvalidOperation:
+                continue
+
+    if tax_percentages:
+        total_percentage = sum(tax_percentages, Decimal("0"))
+        return float(total_percentage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    subtotal = bill.get("subtotal")
+    if subtotal in (None, "", 0, 0.0):
+        return None
+
+    total_tax_amount = Decimal("0")
+    for tax in bill.get("taxes_and_charges", []):
+        amount = tax.get("amount")
+        if amount in (None, ""):
+            continue
+        try:
+            total_tax_amount += Decimal(str(amount))
+        except (InvalidOperation, ValueError):
+            continue
+
+    try:
+        subtotal_value = Decimal(str(subtotal))
+        if subtotal_value == 0:
+            return None
+        percentage = (total_tax_amount / subtotal_value) * Decimal("100")
+        return float(percentage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return None
+
+
+def normalize_expense_data(data):
+    for bill in data.get("bills", []):
+        tax_percentage = bill_tax_percentage(bill)
+        for item in bill.get("items", []):
+            if tax_percentage is not None:
+                item["tax_percentage"] = tax_percentage
+
+            base_amount = item.get("base_amount")
+            if base_amount in (None, ""):
+                continue
+
+            try:
+                base_amount_decimal = Decimal(str(base_amount))
+            except (InvalidOperation, ValueError):
+                continue
+
+            item_tax_percentage = item.get("tax_percentage")
+            if item_tax_percentage in (None, ""):
+                allocated_tax = item.get("taxes_and_charges_allocated")
+            else:
+                try:
+                    allocated_tax = (
+                        base_amount_decimal
+                        * Decimal(str(item_tax_percentage))
+                        / Decimal("100")
+                    )
+                except (InvalidOperation, ValueError, ZeroDivisionError):
+                    allocated_tax = item.get("taxes_and_charges_allocated")
+
+            if allocated_tax not in (None, ""):
+                item["taxes_and_charges_allocated"] = float(
+                    Decimal(str(allocated_tax)).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                )
+
+            final_item_amount = base_amount_decimal
+            if item.get("taxes_and_charges_allocated") not in (None, ""):
+                try:
+                    final_item_amount += Decimal(
+                        str(item["taxes_and_charges_allocated"])
+                    )
+                except (InvalidOperation, ValueError):
+                    pass
+            item["final_item_amount"] = float(
+                final_item_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
+
+    data["bills"] = dedupe_bills(data.get("bills", []))
+    return data
 
 
 def extract_output_text(response_json):
@@ -175,10 +379,12 @@ def call_openai(extracted_text, model, max_retries):
     instructions = (
         "You extract restaurant expense data from noisy OCR receipt text. "
         "Return only data supported by the OCR. Fix obvious OCR mistakes when context is clear. "
-        "For each item, keep base_amount as the receipt line amount before bill-level taxes. "
-        "Set taxes_and_charges_allocated to the item's proportional share of taxes, service charges, "
-        "rounding adjustments, or other bill-level additions. Set final_item_cost to base_amount plus "
-        "that allocation, so item final costs add up as closely as possible to final_bill_amount. "
+        "Check each word for missing, swapped, or incorrect letters and autocorrect likely OCR errors when the surrounding context makes the intended word clear. "
+        "Correct common OCR confusions such as 0/O, 1/I/l, rn/m, cl/d, and broken characters inside item names or tax labels. "
+        "Read the bill-level tax percentages from the receipt tax lines, combine them into a total tax percentage, "
+        "and include that tax_percentage on every item. For each item, keep base_amount as the receipt line amount "
+        "before bill-level taxes. Set taxes_and_charges_allocated to the item's tax amount calculated from its base_amount and tax_percentage, "
+        "then set final_item_amount to base_amount plus taxes_and_charges_allocated. Do not include any bill-level final amount field. "
         "If the OCR is unclear, use nulls and add a warning."
     )
 
@@ -241,9 +447,9 @@ def write_csv(data, output_csv):
         "quantity",
         "unit_price",
         "base_amount",
+        "tax_percentage",
         "taxes_and_charges_allocated",
-        "final_item_cost",
-        "final_bill_amount",
+        "final_item_amount",
         "confidence",
         "warnings",
     ]
@@ -265,11 +471,11 @@ def write_csv(data, output_csv):
                         "quantity": item.get("quantity") or "",
                         "unit_price": money(item.get("unit_price")),
                         "base_amount": money(item.get("base_amount")),
+                        "tax_percentage": money(item.get("tax_percentage")),
                         "taxes_and_charges_allocated": money(
                             item.get("taxes_and_charges_allocated")
                         ),
-                        "final_item_cost": money(item.get("final_item_cost")),
-                        "final_bill_amount": money(bill.get("final_bill_amount")),
+                        "final_item_amount": money(item.get("final_item_amount")),
                         "confidence": bill.get("confidence") or "",
                         "warnings": warnings,
                     }
@@ -280,9 +486,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Use the OpenAI API to convert OCR receipt text into an expense table."
     )
-    parser.add_argument("--input", default=INPUT_FILE, help="OCR text file to read.")
-    parser.add_argument("--csv", default=OUTPUT_CSV, help="CSV table to write.")
-    parser.add_argument("--json", default=OUTPUT_JSON, help="Structured JSON to write.")
+    parser.add_argument("--input", default=str(INPUT_FILE), help="OCR text file to read.")
+    parser.add_argument("--csv", default=str(OUTPUT_CSV), help="CSV table to write.")
+    parser.add_argument("--json", default=str(OUTPUT_JSON), help="Structured JSON to write.")
     parser.add_argument(
         "--model",
         default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
@@ -302,7 +508,10 @@ def main():
     if not extracted_text:
         raise RuntimeError(f"No OCR text found in {args.input}.")
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     data = call_openai(extracted_text, args.model, args.max_retries)
+    normalize_expense_data(data)
     write_json(data, args.json)
     write_csv(data, args.csv)
 

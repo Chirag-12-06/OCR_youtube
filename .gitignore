@@ -1,5 +1,9 @@
-bills/
-bills_cleaned/
-bills_cleaned.txt
+inputs/bills/
+inputs/bills_cleaned/
+inputs/bills_cleaned.txt
+outputs/
 
 .vscode/
+
+__pycache__/
+

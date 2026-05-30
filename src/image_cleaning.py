@@ -1,9 +1,14 @@
-import cv2
 import os
+from pathlib import Path
+
+import cv2
 import numpy as np
 
-input_folder = "bills"
-output_folder = "bills_cleaned"
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INPUT_FOLDER = PROJECT_ROOT / "inputs" / "bills"
+OUTPUT_FOLDER = PROJECT_ROOT / "inputs" / "bills_cleaned"
+
 
 def image_cleaning(input_folder, output_folder):
     validate_Extensions = (".jpg", ".jpeg", ".png")
@@ -58,6 +63,5 @@ def image_cleaning(input_folder, output_folder):
                 print(f"Problem processing {filename}: {e}")
 
 
-
 if __name__ == "__main__":
-    image_cleaning(input_folder, output_folder)
+    image_cleaning(INPUT_FOLDER, OUTPUT_FOLDER)

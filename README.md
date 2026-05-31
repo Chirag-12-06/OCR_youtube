@@ -1,4 +1,4 @@
-# OCR YouTube Expense Extractor
+# OCR Expense Extractor
 
 This repository turns cleaned OCR receipt text into structured expense data.
 
